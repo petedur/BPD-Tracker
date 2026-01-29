@@ -8,6 +8,9 @@ from typing import Dict, List, Tuple
 
 import streamlit as st
 
+# -----------------------------
+# Configuration
+# -----------------------------
 APP_DIR = Path(__file__).parent
 JOURNAL_DIR = APP_DIR / "journals"
 
@@ -17,11 +20,13 @@ DISCLAIMER = (
 )
 
 PRIVACY_NOTE = (
-    "Privacy note: This 'Personal Journal Key' separates data between users, but it is NOT "
+    "Privacy note: Your Personal Journal Key separates data between users, but it is NOT "
     "true security/encryption. Do not enter highly sensitive information."
 )
 
-# Heuristic keyword lists (observational only).
+MOOD_CODES = {"high energy": "H", "low energy": "L", "neutral": "N"}
+
+# Observational keyword lists (heuristic).
 HIGH_ENERGY = [
     "energized", "productive", "excited", "motivated", "great", "amazing", "happy", "confident",
     "focused", "uplifted", "optimistic", "restless", "wired", "invincible", "talkative",
@@ -33,7 +38,7 @@ LOW_ENERGY = [
     "worthless", "no energy", "can't get out of bed"
 ]
 
-# Expanded pools to reduce repetition.
+# Larger follow-up pools + logic to avoid repeats.
 FOLLOWUPS = {
     "high energy": [
         "What helped you feel energized today?",
@@ -43,7 +48,9 @@ FOLLOWUPS = {
         "Did your energy feel steady or spiky today? What do you think influenced that?",
         "What boundaries or pacing might help you keep this energy sustainable?",
         "If you could channel this energy into one small priority tomorrow, what would it be?",
-        "What support (people, routines, environment) helped you feel this way?"
+        "What support (people, routines, environment) helped you feel this way?",
+        "Did you notice any impulsive urges today? How did you respond to them?",
+        "What would a 'balanced version' of today look like?"
     ],
     "low energy": [
         "What felt hardest today, and what felt even slightly easier?",
@@ -52,7 +59,10 @@ FOLLOWUPS = {
         "Were there specific triggers or stressors that stood out today?",
         "What did your body seem to need today (sleep, food, movement, quiet)?",
         "If you could do one gentle thing for yourself tomorrow, what would it be?",
-        "What would you want a close friend to say to you about today?"
+        "Who (or what) helped you feel even slightly less alone today?",
+        "What thoughts kept showing up today, and how did you respond to them?",
+        "What would you want a close friend to say to you about today?",
+        "What is one task you can simplify, postpone, or ask for help with?"
     ],
     "neutral": [
         "What stood out to you today?",
@@ -61,13 +71,17 @@ FOLLOWUPS = {
         "What drained you today, and what restored you?",
         "What emotion showed up the most today, even if it was subtle?",
         "What's one thing you're grateful for from today (big or small)?",
-        "What would make tomorrow feel 10% better?"
+        "What's one thing you wish had gone differently today?",
+        "What did you learn about yourself today?",
+        "What would make tomorrow feel 10% better?",
+        "What pattern are you noticing this week?"
     ],
 }
 
-MOOD_CODES = {"high energy": "H", "low energy": "L", "neutral": "N"}
 
-
+# -----------------------------
+# Storage helpers (per-key file)
+# -----------------------------
 def journal_file_for_key(journal_key: str) -> Path:
     """
     Derive a per-user file from the provided key.
@@ -75,13 +89,11 @@ def journal_file_for_key(journal_key: str) -> Path:
     """
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(journal_key.encode("utf-8")).hexdigest()
-    # 16 hex chars ~ 64 bits; extremely unlikely collision for this use.
-    fname = f"journal_{digest[:16]}.json"
-    return JOURNAL_DIR / fname
+    return JOURNAL_DIR / f"journal_{digest[:16]}.json"
 
 
 def normalize_entries(entries: List[dict]) -> List[dict]:
-    """Backwards-compatible normalization for older saved entries."""
+    """Backwards-compatible normalization."""
     out: List[dict] = []
     for e in entries:
         if not isinstance(e, dict):
@@ -94,16 +106,13 @@ def normalize_entries(entries: List[dict]) -> List[dict]:
 
         entry_date = e.get("entry_date")
         if not entry_date:
-            if isinstance(created_at, str) and len(created_at) >= 10:
-                entry_date = created_at[:10]
-            else:
-                entry_date = date.today().isoformat()
+            entry_date = created_at[:10] if isinstance(created_at, str) and len(created_at) >= 10 else date.today().isoformat()
         e["entry_date"] = entry_date
 
-        if "mood" not in e:
-            e["mood"] = "neutral"
-        if "text" not in e:
-            e["text"] = ""
+        e["mood"] = e.get("mood", "neutral")
+        e["text"] = e.get("text", "")
+        if "followup" not in e:
+            e["followup"] = None
 
         out.append(e)
     return out
@@ -124,6 +133,9 @@ def save_entries(entries: List[dict], data_file: Path) -> None:
     data_file.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+# -----------------------------
+# Mood + followup logic
+# -----------------------------
 def classify_mood(text: str) -> str:
     t = text.lower()
     high = sum(1 for w in HIGH_ENERGY if w in t)
@@ -137,26 +149,30 @@ def classify_mood(text: str) -> str:
 
 def pick_followup(mood: str, entries: List[dict]) -> str:
     """
-    Always changes prompt by:
-    - preferring prompts not used before for that mood
-    - avoiding repeating the immediately previous prompt in this session
+    Make the follow-up change on every save:
+    - Avoid repeating the last follow-up shown (session-level)
+    - Avoid repeating any of the last N follow-ups used (journal-level)
+    - If the pool is exhausted, we still avoid repeating the immediately previous prompt if possible
     """
-    pool = FOLLOWUPS[mood]
-    used_for_mood = [e.get("followup") for e in entries if e.get("mood") == mood and e.get("followup")]
+    pool = FOLLOWUPS[mood][:]
+    last_session = st.session_state.get("last_followup")
 
-    candidates = [q for q in pool if q not in used_for_mood]
+    recent = [e.get("followup") for e in entries if e.get("followup")]
+    recent = [x for x in recent if isinstance(x, str)]
+    recent_last_n = recent[-5:]  # avoid last 5 prompts overall
+
+    candidates = [q for q in pool if q != last_session and q not in recent_last_n]
     if not candidates:
-        candidates = pool[:]  # reset after exhausting the pool
-
-    last = st.session_state.get("last_followup")
-    if last in candidates and len(candidates) > 1:
-        candidates = [q for q in candidates if q != last]
+        candidates = [q for q in pool if q != last_session] or pool[:]  # fallback
 
     q = random.choice(candidates)
     st.session_state["last_followup"] = q
     return q
 
 
+# -----------------------------
+# Calendar + cycle tracking
+# -----------------------------
 def daily_moods(entries: List[dict]) -> Dict[str, str]:
     """Map YYYY-MM-DD -> mood using the most recently saved entry for that date."""
     best: Dict[str, Tuple[str, str]] = {}
@@ -206,12 +222,15 @@ def calendar_blocks(day_to_mood: Dict[str, str]) -> str:
 
 
 def compute_streaks(day_to_mood: Dict[str, str]) -> List[Tuple[str, str, str, int]]:
-    """Return streaks (start_date, end_date, mood, length) for consecutive days with entries."""
+    """
+    Streaks of consecutive days where the DAILY mood label is the same.
+    Note: This is observational (based on labels), not diagnosis of episodes.
+    """
     if not day_to_mood:
         return []
     days = sorted(date.fromisoformat(d) for d in day_to_mood.keys())
-    streaks: List[Tuple[str, str, str, int]] = []
 
+    streaks: List[Tuple[str, str, str, int]] = []
     start = days[0]
     prev = days[0]
     current_mood = day_to_mood[start.isoformat()]
@@ -232,21 +251,53 @@ def compute_streaks(day_to_mood: Dict[str, str]) -> List[Tuple[str, str, str, in
     return streaks
 
 
+def compute_switches(day_to_mood: Dict[str, str]) -> List[Tuple[str, str, str]]:
+    """
+    Detect changes between high/low energy labels (ignoring neutral).
+    Returns a list of (date, from_mood, to_mood).
+    """
+    if not day_to_mood:
+        return []
+    days_sorted = sorted(day_to_mood.keys())
+    switches: List[Tuple[str, str, str]] = []
+
+    prev_mood = None
+    prev_day = None
+    for d in days_sorted:
+        mood = day_to_mood[d]
+        if mood == "neutral":
+            continue
+        if prev_mood is None:
+            prev_mood = mood
+            prev_day = d
+            continue
+        if mood != prev_mood:
+            switches.append((d, prev_mood, mood))
+            prev_mood = mood
+            prev_day = d
+
+    return switches
+
+
 def make_report(entries: List[dict]) -> str:
     day_to_mood = daily_moods(entries)
     streaks = compute_streaks(day_to_mood)
+    switches = compute_switches(day_to_mood)
 
     lines: List[str] = []
-    lines.append("OBSERVATIONAL JOURNAL SUMMARY (NON-DIAGNOSTIC)")
+    lines.append("JOURNAL TRACKER - OBSERVATIONAL SUMMARY (NON-DIAGNOSTIC)")
     lines.append("")
     lines.append(DISCLAIMER)
     lines.append("")
-    lines.append("Note: 'high energy' / 'low energy' labels are heuristic keyword matches and are NOT a")
-    lines.append("diagnosis of manic, hypomanic, or depressive episodes. Interpret with a clinician.")
+    lines.append(
+        "Note: The labels 'high energy' and 'low energy' are heuristic keyword matches and are NOT a "
+        "diagnosis of manic/hypomanic or depressive episodes. Interpret with a clinician."
+    )
     lines.append("")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
 
+    # Distribution by day
     counts_by_day = {"high energy": 0, "low energy": 0, "neutral": 0}
     for mood in day_to_mood.values():
         counts_by_day[mood] = counts_by_day.get(mood, 0) + 1
@@ -256,20 +307,33 @@ def make_report(entries: List[dict]) -> str:
         lines.append(f"- {k}: {v}")
     lines.append("")
 
+    # Streaks
     if streaks:
-        longest = sorted(streaks, key=lambda x: x[3], reverse=True)[:10]
         lines.append("Mood streaks (consecutive days with the same mood label):")
-        for s, e, mood, n in longest:
+        top = sorted(streaks, key=lambda x: x[3], reverse=True)[:10]
+        for s, e, mood, n in top:
             span = s if s == e else f"{s} to {e}"
             lines.append(f"- {span}: {mood} ({n} day{'s' if n != 1 else ''})")
         lines.append("")
     else:
-        lines.append("Mood streaks: none yet (no dated entries).")
+        lines.append("Mood streaks: none yet.")
         lines.append("")
 
+    # Switches
+    lines.append("Mood switches (high<->low, ignoring neutral days):")
+    if switches:
+        for d, frm, to in switches[-10:]:
+            lines.append(f"- {d}: {frm} -> {to}")
+        lines.append(f"Total switches recorded: {len(switches)}")
+    else:
+        lines.append("- None recorded yet.")
+    lines.append("")
+
+    # Calendar
     lines.append(calendar_blocks(day_to_mood))
     lines.append("")
 
+    # Recent entries
     lines.append("Most recent entries:")
     for e in entries[-10:]:
         lines.append("")
@@ -281,13 +345,14 @@ def make_report(entries: List[dict]) -> str:
     return "\n".join(lines)
 
 
-# ---------------- UI ----------------
-
-st.set_page_config(page_title="BPD Support Journal", layout="centered")
-st.title("BPD Support Journal (Prototype)")
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Journal Tracker", layout="centered")
+st.title("Journal Tracker")
 st.caption(DISCLAIMER)
 
-# Personal Journal Key (per-user separation)
+# Personal journal separation
 st.sidebar.header("Your journal")
 journal_key = st.sidebar.text_input("Personal Journal Key (required)", type="password")
 st.sidebar.caption(PRIVACY_NOTE)
@@ -306,7 +371,7 @@ entry_day = st.date_input(
     "Entry date (required)",
     value=date.today(),
     max_value=date.today(),
-    help="Pick the day this entry is ABOUT. You can backdate to add entries for past days.",
+    help="Pick the day this entry is about. You can type a date or use the calendar to backdate entries.",
 )
 
 text = st.text_area("Write your journal entry", height=160, placeholder="Type here...")
@@ -347,6 +412,28 @@ st.divider()
 st.subheader("Mood calendar")
 day_to_mood = daily_moods(entries)
 st.code(calendar_blocks(day_to_mood), language="text")
+
+st.subheader("Cycle patterns (observational)")
+if not day_to_mood:
+    st.write("Add some dated entries to see patterns here.")
+else:
+    streaks = compute_streaks(day_to_mood)
+    switches = compute_switches(day_to_mood)
+
+    if streaks:
+        top = sorted(streaks, key=lambda x: x[3], reverse=True)[:5]
+        st.write("Top streaks (by length):")
+        for s, e, mood, n in top:
+            span = s if s == e else f"{s} to {e}"
+            st.write(f"- {span}: {mood} ({n} day{'s' if n != 1 else ''})")
+
+    st.write("")
+    st.write("Recent switches (high<->low, ignoring neutral):")
+    if switches:
+        for d, frm, to in switches[-5:]:
+            st.write(f"- {d}: {frm} -> {to}")
+    else:
+        st.write("- None recorded yet.")
 
 st.subheader("History")
 if not entries:
