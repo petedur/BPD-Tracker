@@ -3,16 +3,22 @@ from pathlib import Path
 from datetime import datetime, date
 import random
 import calendar
+import hashlib
 from typing import Dict, List, Tuple
 
 import streamlit as st
 
 APP_DIR = Path(__file__).parent
-DATA_FILE = APP_DIR / "journal_entries.json"
+JOURNAL_DIR = APP_DIR / "journals"
 
 DISCLAIMER = (
-    "Disclaimer: This tool isS is observational only and does NOT provide diagnoses, "
+    "Disclaimer: This tool is observational only and does NOT provide diagnoses, "
     "medical advice, medication advice, or emergency services."
+)
+
+PRIVACY_NOTE = (
+    "Privacy note: This 'Personal Journal Key' separates data between users, but it is NOT "
+    "true security/encryption. Do not enter highly sensitive information."
 )
 
 # Heuristic keyword lists (observational only).
@@ -36,8 +42,6 @@ FOLLOWUPS = {
         "What was your sleep like recently, and did it affect your energy today?",
         "Did your energy feel steady or spiky today? What do you think influenced that?",
         "What boundaries or pacing might help you keep this energy sustainable?",
-        "What did you say 'yes' to today that you want to keep saying yes to?",
-        "What did you say 'no' to today that protected your time or wellbeing?",
         "If you could channel this energy into one small priority tomorrow, what would it be?",
         "What support (people, routines, environment) helped you feel this way?"
     ],
@@ -48,26 +52,32 @@ FOLLOWUPS = {
         "Were there specific triggers or stressors that stood out today?",
         "What did your body seem to need today (sleep, food, movement, quiet)?",
         "If you could do one gentle thing for yourself tomorrow, what would it be?",
-        "Who (or what) helped you feel even slightly less alone today?",
-        "What thoughts kept showing up today, and how did you respond to them?",
-        "What would you want a close friend to say to you about today?",
-        "What is one small task you could simplify or postpone to reduce pressure?"
+        "What would you want a close friend to say to you about today?"
     ],
     "neutral": [
         "What stood out to you today?",
         "If today had a theme, what would it be?",
         "What do you want to pay attention to tomorrow?",
-        "What did you do today that supported your wellbeing (even in a small way)?",
         "What drained you today, and what restored you?",
         "What emotion showed up the most today, even if it was subtle?",
         "What's one thing you're grateful for from today (big or small)?",
-        "What's one thing you wish had gone differently today?",
-        "What did you learn about yourself today?",
         "What would make tomorrow feel 10% better?"
     ],
 }
 
 MOOD_CODES = {"high energy": "H", "low energy": "L", "neutral": "N"}
+
+
+def journal_file_for_key(journal_key: str) -> Path:
+    """
+    Derive a per-user file from the provided key.
+    We hash the key so the filename does not reveal the key itself.
+    """
+    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(journal_key.encode("utf-8")).hexdigest()
+    # 16 hex chars ~ 64 bits; extremely unlikely collision for this use.
+    fname = f"journal_{digest[:16]}.json"
+    return JOURNAL_DIR / fname
 
 
 def normalize_entries(entries: List[dict]) -> List[dict]:
@@ -99,10 +109,10 @@ def normalize_entries(entries: List[dict]) -> List[dict]:
     return out
 
 
-def load_entries() -> List[dict]:
-    if DATA_FILE.exists():
+def load_entries(data_file: Path) -> List[dict]:
+    if data_file.exists():
         try:
-            entries = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            entries = json.loads(data_file.read_text(encoding="utf-8"))
             if isinstance(entries, list):
                 return normalize_entries(entries)
         except Exception:
@@ -110,8 +120,8 @@ def load_entries() -> List[dict]:
     return []
 
 
-def save_entries(entries: List[dict]) -> None:
-    DATA_FILE.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+def save_entries(entries: List[dict], data_file: Path) -> None:
+    data_file.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def classify_mood(text: str) -> str:
@@ -127,9 +137,9 @@ def classify_mood(text: str) -> str:
 
 def pick_followup(mood: str, entries: List[dict]) -> str:
     """
-    Ensures a new prompt each save by:
+    Always changes prompt by:
     - preferring prompts not used before for that mood
-    - avoiding repeating the immediately previous prompt globally
+    - avoiding repeating the immediately previous prompt in this session
     """
     pool = FOLLOWUPS[mood]
     used_for_mood = [e.get("followup") for e in entries if e.get("mood") == mood and e.get("followup")]
@@ -232,7 +242,7 @@ def make_report(entries: List[dict]) -> str:
     lines.append(DISCLAIMER)
     lines.append("")
     lines.append("Note: 'high energy' / 'low energy' labels are heuristic keyword matches and are NOT a")
-    lines.append("diagnosis of manic, hypomanic, or depressive episodes. Please interpret with a clinician.")
+    lines.append("diagnosis of manic, hypomanic, or depressive episodes. Interpret with a clinician.")
     lines.append("")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
@@ -271,12 +281,24 @@ def make_report(entries: List[dict]) -> str:
     return "\n".join(lines)
 
 
-# --- UI ---
+# ---------------- UI ----------------
+
 st.set_page_config(page_title="BPD Support Journal", layout="centered")
 st.title("BPD Support Journal (Prototype)")
 st.caption(DISCLAIMER)
 
-entries = load_entries()
+# Personal Journal Key (per-user separation)
+st.sidebar.header("Your journal")
+journal_key = st.sidebar.text_input("Personal Journal Key (required)", type="password")
+st.sidebar.caption(PRIVACY_NOTE)
+st.sidebar.caption("If you forget this key, you will lose access to that journal.")
+
+if not journal_key.strip():
+    st.info("Enter a Personal Journal Key in the sidebar to start.")
+    st.stop()
+
+data_file = journal_file_for_key(journal_key.strip())
+entries = load_entries(data_file)
 
 st.subheader("New entry")
 
@@ -293,11 +315,11 @@ col1, col2 = st.columns([1, 1])
 with col1:
     submitted = st.button("Save entry", type="primary")
 with col2:
-    clear = st.button("Clear all saved entries")
+    clear = st.button("Clear this journal's entries")
 
 if clear:
-    save_entries([])
-    st.success("Cleared saved entries.")
+    save_entries([], data_file)
+    st.success("Cleared entries for this journal key.")
     st.rerun()
 
 if submitted:
@@ -315,7 +337,7 @@ if submitted:
             "followup": followup,
         }
         entries.append(entry)
-        save_entries(entries)
+        save_entries(entries, data_file)
 
         st.success(f"Saved. Mood (observational): {mood} for {entry_day.isoformat()}")
         st.info(f"Follow-up question: {followup}")
@@ -328,9 +350,8 @@ st.code(calendar_blocks(day_to_mood), language="text")
 
 st.subheader("History")
 if not entries:
-    st.write("No saved entries yet.")
+    st.write("No saved entries yet for this journal key.")
 else:
-    # Most recent first by save-time
     entries_sorted = sorted(entries, key=lambda e: (e.get("created_at", ""), e.get("entry_date", "")))
     for e in reversed(entries_sorted[-50:]):
         title = f"{e.get('entry_date','')}  |  {e.get('mood','')}  |  saved {e.get('created_at','')}"
